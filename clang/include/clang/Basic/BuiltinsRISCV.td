@@ -29,6 +29,9 @@ def clz_64 : RISCVBuiltin<"unsigned int(uint64_t)", "zbb|xtheadbb,64bit">;
 def ctz_32 : RISCVBuiltin<"unsigned int(unsigned int)", "zbb">;
 def ctz_64 : RISCVBuiltin<"unsigned int(uint64_t)", "zbb,64bit">;
 
+// dot product (int64_t *a, int64_t *b, uint64_t n) -> int64_t
+def dot : RISCVBuiltin<"int64_t(int64_t*, int64_t*, uint64_t)", "">;
+
 //===----------------------------------------------------------------------===//
 // Zbc or Zbkc extension.
 //===----------------------------------------------------------------------===//
@@ -146,14 +149,3 @@ let Features = "zihintntl", Attributes = [CustomTypeChecking] in {
 def ntl_load : RISCVBuiltin<"void(...)">;
 def ntl_store : RISCVBuiltin<"void(...)">;
 } // Features = "zihintntl", Attributes = [CustomTypeChecking]
-
-//===----------------------------------------------------------------------===//
-// Zihintpause extension.
-//===----------------------------------------------------------------------===//
-let Features = "zihintpause", Attributes = [NoThrow] in
-def pause : RISCVBuiltin<"void()">;
-
-//===----------------------------------------------------------------------===//
-// XCV extensions.
-//===----------------------------------------------------------------------===//
-include "clang/Basic/BuiltinsRISCVXCV.td"

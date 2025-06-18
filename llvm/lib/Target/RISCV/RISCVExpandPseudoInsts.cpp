@@ -13,9 +13,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "RISCV.h"
+#include <iterator>
 #include "RISCVInstrInfo.h"
 #include "RISCVTargetMachine.h"
 
+#include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/LivePhysRegs.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
@@ -41,23 +43,20 @@ public:
   StringRef getPassName() const override { return RISCV_EXPAND_PSEUDO_NAME; }
 
 private:
+  bool expandDot(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
+                 MachineBasicBlock::iterator &NextMBBI);
   bool expandMBB(MachineBasicBlock &MBB);
   bool expandMI(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
                 MachineBasicBlock::iterator &NextMBBI);
   bool expandCCOp(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
                   MachineBasicBlock::iterator &NextMBBI);
+  bool expandVSetVL(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI);
   bool expandVMSET_VMCLR(MachineBasicBlock &MBB,
                          MachineBasicBlock::iterator MBBI, unsigned Opcode);
-  bool expandMV_FPR16INX(MachineBasicBlock &MBB,
-                         MachineBasicBlock::iterator MBBI);
-  bool expandMV_FPR32INX(MachineBasicBlock &MBB,
-                         MachineBasicBlock::iterator MBBI);
   bool expandRV32ZdinxStore(MachineBasicBlock &MBB,
                             MachineBasicBlock::iterator MBBI);
   bool expandRV32ZdinxLoad(MachineBasicBlock &MBB,
                            MachineBasicBlock::iterator MBBI);
-  bool expandPseudoReadVLENBViaVSETVLIX0(MachineBasicBlock &MBB,
-                                         MachineBasicBlock::iterator MBBI);
 #ifndef NDEBUG
   unsigned getInstSizeInBytes(const MachineFunction &MF) const {
     unsigned Size = 0;
@@ -72,6 +71,7 @@ private:
 char RISCVExpandPseudo::ID = 0;
 
 bool RISCVExpandPseudo::runOnMachineFunction(MachineFunction &MF) {
+  errs() << "*** RISCVExpandPseudo running on " << MF.getName() << "\n";
   STI = &MF.getSubtarget<RISCVSubtarget>();
   TII = STI->getInstrInfo();
 
@@ -103,17 +103,151 @@ bool RISCVExpandPseudo::expandMBB(MachineBasicBlock &MBB) {
   return Modified;
 }
 
+/// Expand pseudo-instructiunea DOT intr-un loop 2× un-rolled
+///   ACC = 0
+///   for (i = 0; i < n; i += 2) {
+///       ACC += a[i]   * b[i];
+///       ACC += a[i+1] * b[i+1];
+///   }
+///   Rd = ACC;
+///
+/// • Ruleaza post-RA ⇒ folosim doar registre fizice caller-saved
+/// • Nu introducem vreg-uri noi, deci SSA ramane intacta
+/// • *n* trebuie sa fie par (altfel ultimul element nu e procesat;
+///   TODO: tail-loop daca se doreste suport complet)
+bool RISCVExpandPseudo::expandDot(MachineBasicBlock &MBB,
+                                  MachineBasicBlock::iterator MBBI,
+                                  MachineBasicBlock::iterator &NextMBBI) {
+  errs() << ">>> expandDot() called for DOT pseudo\n";
+
+  MachineInstr &MI = *MBBI;
+  const DebugLoc DL = MI.getDebugLoc();
+
+  /* --- 1. Validare rapida ------------------------------------------------ */
+  if (MI.getNumOperands() != 4 || !MI.getOperand(0).isReg() ||
+      !MI.getOperand(1).isReg() || !MI.getOperand(2).isReg() ||
+      !MI.getOperand(3).isReg())
+    return false;
+
+  Register Rd = MI.getOperand(0).getReg();   // dest
+  Register SrcA = MI.getOperand(1).getReg(); // ptr a
+  Register SrcB = MI.getOperand(2).getReg(); // ptr b
+  Register SrcN = MI.getOperand(3).getReg(); // n
+
+  /* --- 2. Registre fizice temporare -------------------------------------- */
+  const Register ACC = RISCV::X13;   // s3
+  const Register PTR_A = RISCV::X5;  // t0
+  const Register PTR_B = RISCV::X6;  // t1
+  const Register END_A = RISCV::X16; // t5 : capat vector a
+  const Register VA0 = RISCV::X28;   // t3
+  const Register VA1 = RISCV::X14;   // t1' (suficient liber)
+  const Register VB0 = RISCV::X29;   // t4
+  const Register VB1 = RISCV::X15;   // t2'
+
+  MachineFunction &MF = *MBB.getParent();
+  const auto *TII = MF.getSubtarget<RISCVSubtarget>().getInstrInfo();
+
+  /* --- 3. Cream blocurile loop / exit ------------------------------------ */
+  auto *LoopMBB = MF.CreateMachineBasicBlock();
+  auto *ExitMBB = MF.CreateMachineBasicBlock();
+  MF.insert(std::next(MachineFunction::iterator(&MBB)), LoopMBB);
+  MF.insert(std::next(MachineFunction::iterator(LoopMBB)), ExitMBB);
+
+  /* mutam instr. după DOT in Exit */
+  ExitMBB->splice(ExitMBB->begin(), &MBB, std::next(MBBI), MBB.end());
+  ExitMBB->transferSuccessorsAndUpdatePHIs(&MBB);
+
+  /* re-legam CFG */
+  while (!MBB.succ_empty())
+    MBB.removeSuccessor(MBB.succ_begin());
+  MBB.addSuccessor(LoopMBB);
+  LoopMBB->addSuccessor(LoopMBB); // back-edge
+  LoopMBB->addSuccessor(ExitMBB); // fall-through
+
+  /* --- 4. Pre-header ----------------------------------------------------- */
+  // ACC = 0
+  BuildMI(MBB, MBBI, DL, TII->get(RISCV::ADDI), ACC)
+      .addReg(RISCV::X0)
+      .addImm(0);
+
+  // PTR_A = a , PTR_B = b
+  BuildMI(MBB, MBBI, DL, TII->get(RISCV::ADDI), PTR_A).addReg(SrcA).addImm(0);
+  BuildMI(MBB, MBBI, DL, TII->get(RISCV::ADDI), PTR_B).addReg(SrcB).addImm(0);
+
+  // END_A = a + n*8   (<<3)
+  BuildMI(MBB, MBBI, DL, TII->get(RISCV::SLLI), END_A).addReg(SrcN).addImm(3);
+  BuildMI(MBB, MBBI, DL, TII->get(RISCV::ADD), END_A)
+      .addReg(END_A)
+      .addReg(SrcA);
+
+  // JAL x0, LoopMBB
+  BuildMI(MBB, std::next(MBBI), DL, TII->get(RISCV::JAL))
+      .addReg(RISCV::X0, RegState::Define)
+      .addMBB(LoopMBB);
+
+  /* --- 5. Loop body 2× un-rolled ---------------------------------------- */
+  auto End = LoopMBB->end();
+
+  // load a[i] / a[i+1]
+  BuildMI(*LoopMBB, End, DL, TII->get(RISCV::LD), VA0).addReg(PTR_A).addImm(0);
+  BuildMI(*LoopMBB, End, DL, TII->get(RISCV::LD), VA1).addReg(PTR_A).addImm(8);
+
+  // load b[i] / b[i+1]
+  BuildMI(*LoopMBB, End, DL, TII->get(RISCV::LD), VB0).addReg(PTR_B).addImm(0);
+  BuildMI(*LoopMBB, End, DL, TII->get(RISCV::LD), VB1).addReg(PTR_B).addImm(8);
+
+  // MUL-uri
+  BuildMI(*LoopMBB, End, DL, TII->get(RISCV::MUL), VB0).addReg(VA0).addReg(VB0);
+  BuildMI(*LoopMBB, End, DL, TII->get(RISCV::MUL), VB1).addReg(VA1).addReg(VB1);
+
+  // ACC += prod0 + prod1
+  BuildMI(*LoopMBB, End, DL, TII->get(RISCV::ADD), ACC).addReg(ACC).addReg(VB0);
+  BuildMI(*LoopMBB, End, DL, TII->get(RISCV::ADD), ACC).addReg(ACC).addReg(VB1);
+
+  // avansam ptr-urile cu 16 B
+  BuildMI(*LoopMBB, End, DL, TII->get(RISCV::ADDI), PTR_A)
+      .addReg(PTR_A)
+      .addImm(16);
+  BuildMI(*LoopMBB, End, DL, TII->get(RISCV::ADDI), PTR_B)
+      .addReg(PTR_B)
+      .addImm(16);
+
+  // BLT PTR_A, END_A, LoopMBB
+  BuildMI(*LoopMBB, End, DL, TII->get(RISCV::BLT))
+      .addReg(PTR_A)
+      .addReg(END_A)
+      .addMBB(LoopMBB);
+
+  /* --- 6. Exit: copiem ACC in Rd ---------------------------------------- */
+  BuildMI(*ExitMBB, ExitMBB->begin(), DL, TII->get(RISCV::ADDI), Rd)
+      .addReg(ACC)
+      .addImm(0);
+
+  /* --- 7. Live-ins ------------------------------------------------------- */
+  for (Register R : {ACC, PTR_A, PTR_B, END_A})
+    if (!LoopMBB->isLiveIn(R))
+      LoopMBB->addLiveIn(R);
+  if (!ExitMBB->isLiveIn(ACC))
+    ExitMBB->addLiveIn(ACC);
+
+  /* --- 8. Curatenie ------------------------------------------------------ */
+  MF.RenumberBlocks();
+  NextMBBI = MBB.erase(MBBI); // ştergem pseudo-instr. şi continuăm
+  return true;
+}
+
+
 bool RISCVExpandPseudo::expandMI(MachineBasicBlock &MBB,
                                  MachineBasicBlock::iterator MBBI,
                                  MachineBasicBlock::iterator &NextMBBI) {
   // RISCVInstrInfo::getInstSizeInBytes expects that the total size of the
   // expanded instructions for each pseudo is correct in the Size field of the
   // tablegen definition for the pseudo.
+  errs() << ">>> expandMI: opcode = " << MBBI->getOpcode() << "\n";
   switch (MBBI->getOpcode()) {
-  case RISCV::PseudoMV_FPR16INX:
-    return expandMV_FPR16INX(MBB, MBBI);
-  case RISCV::PseudoMV_FPR32INX:
-    return expandMV_FPR32INX(MBB, MBBI);
+  case RISCV::DOT:
+    errs() << ">>> Detected DOT pseudo-instruction\n";
+    return expandDot(MBB, MBBI, NextMBBI);
   case RISCV::PseudoRV32ZdinxSD:
     return expandRV32ZdinxStore(MBB, MBBI);
   case RISCV::PseudoRV32ZdinxLD:
@@ -148,6 +282,10 @@ bool RISCVExpandPseudo::expandMI(MachineBasicBlock &MBB,
   case RISCV::PseudoCCORN:
   case RISCV::PseudoCCXNOR:
     return expandCCOp(MBB, MBBI, NextMBBI);
+  case RISCV::PseudoVSETVLI:
+  case RISCV::PseudoVSETVLIX0:
+  case RISCV::PseudoVSETIVLI:
+    return expandVSetVL(MBB, MBBI);
   case RISCV::PseudoVMCLR_M_B1:
   case RISCV::PseudoVMCLR_M_B2:
   case RISCV::PseudoVMCLR_M_B4:
@@ -166,8 +304,6 @@ bool RISCVExpandPseudo::expandMI(MachineBasicBlock &MBB,
   case RISCV::PseudoVMSET_M_B64:
     // vmset.m vd => vmxnor.mm vd, vd, vd
     return expandVMSET_VMCLR(MBB, MBBI, RISCV::VMXNOR_MM);
-  case RISCV::PseudoReadVLENBViaVSETVLIX0:
-    return expandPseudoReadVLENBViaVSETVLIX0(MBB, MBBI);
   }
 
   return false;
@@ -265,6 +401,36 @@ bool RISCVExpandPseudo::expandCCOp(MachineBasicBlock &MBB,
   return true;
 }
 
+bool RISCVExpandPseudo::expandVSetVL(MachineBasicBlock &MBB,
+                                     MachineBasicBlock::iterator MBBI) {
+  assert(MBBI->getNumExplicitOperands() == 3 && MBBI->getNumOperands() >= 5 &&
+         "Unexpected instruction format");
+
+  DebugLoc DL = MBBI->getDebugLoc();
+
+  assert((MBBI->getOpcode() == RISCV::PseudoVSETVLI ||
+          MBBI->getOpcode() == RISCV::PseudoVSETVLIX0 ||
+          MBBI->getOpcode() == RISCV::PseudoVSETIVLI) &&
+         "Unexpected pseudo instruction");
+  unsigned Opcode;
+  if (MBBI->getOpcode() == RISCV::PseudoVSETIVLI)
+    Opcode = RISCV::VSETIVLI;
+  else
+    Opcode = RISCV::VSETVLI;
+  const MCInstrDesc &Desc = TII->get(Opcode);
+  assert(Desc.getNumOperands() == 3 && "Unexpected instruction format");
+
+  Register DstReg = MBBI->getOperand(0).getReg();
+  bool DstIsDead = MBBI->getOperand(0).isDead();
+  BuildMI(MBB, MBBI, DL, Desc)
+      .addReg(DstReg, RegState::Define | getDeadRegState(DstIsDead))
+      .add(MBBI->getOperand(1))  // VL
+      .add(MBBI->getOperand(2)); // VType
+
+  MBBI->eraseFromParent(); // The pseudo instruction is gone now.
+  return true;
+}
+
 bool RISCVExpandPseudo::expandVMSET_VMCLR(MachineBasicBlock &MBB,
                                           MachineBasicBlock::iterator MBBI,
                                           unsigned Opcode) {
@@ -274,40 +440,6 @@ bool RISCVExpandPseudo::expandVMSET_VMCLR(MachineBasicBlock &MBB,
   BuildMI(MBB, MBBI, DL, Desc, DstReg)
       .addReg(DstReg, RegState::Undef)
       .addReg(DstReg, RegState::Undef);
-  MBBI->eraseFromParent(); // The pseudo instruction is gone now.
-  return true;
-}
-
-bool RISCVExpandPseudo::expandMV_FPR16INX(MachineBasicBlock &MBB,
-                                          MachineBasicBlock::iterator MBBI) {
-  DebugLoc DL = MBBI->getDebugLoc();
-  const TargetRegisterInfo *TRI = STI->getRegisterInfo();
-  Register DstReg = TRI->getMatchingSuperReg(
-      MBBI->getOperand(0).getReg(), RISCV::sub_16, &RISCV::GPRRegClass);
-  Register SrcReg = TRI->getMatchingSuperReg(
-      MBBI->getOperand(1).getReg(), RISCV::sub_16, &RISCV::GPRRegClass);
-
-  BuildMI(MBB, MBBI, DL, TII->get(RISCV::ADDI), DstReg)
-      .addReg(SrcReg, getKillRegState(MBBI->getOperand(1).isKill()))
-      .addImm(0);
-
-  MBBI->eraseFromParent(); // The pseudo instruction is gone now.
-  return true;
-}
-
-bool RISCVExpandPseudo::expandMV_FPR32INX(MachineBasicBlock &MBB,
-                                          MachineBasicBlock::iterator MBBI) {
-  DebugLoc DL = MBBI->getDebugLoc();
-  const TargetRegisterInfo *TRI = STI->getRegisterInfo();
-  Register DstReg = TRI->getMatchingSuperReg(
-      MBBI->getOperand(0).getReg(), RISCV::sub_32, &RISCV::GPRRegClass);
-  Register SrcReg = TRI->getMatchingSuperReg(
-      MBBI->getOperand(1).getReg(), RISCV::sub_32, &RISCV::GPRRegClass);
-
-  BuildMI(MBB, MBBI, DL, TII->get(RISCV::ADDI), DstReg)
-      .addReg(SrcReg, getKillRegState(MBBI->getOperand(1).isKill()))
-      .addImm(0);
-
   MBBI->eraseFromParent(); // The pseudo instruction is gone now.
   return true;
 }
@@ -323,40 +455,38 @@ bool RISCVExpandPseudo::expandRV32ZdinxStore(MachineBasicBlock &MBB,
       TRI->getSubReg(MBBI->getOperand(0).getReg(), RISCV::sub_gpr_even);
   Register Hi =
       TRI->getSubReg(MBBI->getOperand(0).getReg(), RISCV::sub_gpr_odd);
-  if (Hi == RISCV::DUMMY_REG_PAIR_WITH_X0)
-    Hi = RISCV::X0;
 
-  auto MIBLo = BuildMI(MBB, MBBI, DL, TII->get(RISCV::SW))
-                   .addReg(Lo, getKillRegState(MBBI->getOperand(0).isKill()))
-                   .addReg(MBBI->getOperand(1).getReg())
-                   .add(MBBI->getOperand(2));
+  assert(MBBI->hasOneMemOperand() && "Expected mem operand");
+  MachineMemOperand *OldMMO = MBBI->memoperands().front();
+  MachineFunction *MF = MBB.getParent();
+  MachineMemOperand *MMOLo = MF->getMachineMemOperand(OldMMO, 0, 4);
+  MachineMemOperand *MMOHi = MF->getMachineMemOperand(OldMMO, 4, 4);
 
-  MachineInstrBuilder MIBHi;
+  BuildMI(MBB, MBBI, DL, TII->get(RISCV::SW))
+      .addReg(Lo, getKillRegState(MBBI->getOperand(0).isKill()))
+      .addReg(MBBI->getOperand(1).getReg())
+      .add(MBBI->getOperand(2))
+      .setMemRefs(MMOLo);
+
   if (MBBI->getOperand(2).isGlobal() || MBBI->getOperand(2).isCPI()) {
+    // FIXME: Zdinx RV32 can not work on unaligned scalar memory.
+    assert(!STI->enableUnalignedScalarMem());
+
     assert(MBBI->getOperand(2).getOffset() % 8 == 0);
     MBBI->getOperand(2).setOffset(MBBI->getOperand(2).getOffset() + 4);
-    MIBHi = BuildMI(MBB, MBBI, DL, TII->get(RISCV::SW))
-                .addReg(Hi, getKillRegState(MBBI->getOperand(0).isKill()))
-                .add(MBBI->getOperand(1))
-                .add(MBBI->getOperand(2));
+    BuildMI(MBB, MBBI, DL, TII->get(RISCV::SW))
+        .addReg(Hi, getKillRegState(MBBI->getOperand(0).isKill()))
+        .add(MBBI->getOperand(1))
+        .add(MBBI->getOperand(2))
+        .setMemRefs(MMOHi);
   } else {
     assert(isInt<12>(MBBI->getOperand(2).getImm() + 4));
-    MIBHi = BuildMI(MBB, MBBI, DL, TII->get(RISCV::SW))
-                .addReg(Hi, getKillRegState(MBBI->getOperand(0).isKill()))
-                .add(MBBI->getOperand(1))
-                .addImm(MBBI->getOperand(2).getImm() + 4);
+    BuildMI(MBB, MBBI, DL, TII->get(RISCV::SW))
+        .addReg(Hi, getKillRegState(MBBI->getOperand(0).isKill()))
+        .add(MBBI->getOperand(1))
+        .addImm(MBBI->getOperand(2).getImm() + 4)
+        .setMemRefs(MMOHi);
   }
-
-  MachineFunction *MF = MBB.getParent();
-  SmallVector<MachineMemOperand *> NewLoMMOs;
-  SmallVector<MachineMemOperand *> NewHiMMOs;
-  for (const MachineMemOperand *MMO : MBBI->memoperands()) {
-    NewLoMMOs.push_back(MF->getMachineMemOperand(MMO, 0, 4));
-    NewHiMMOs.push_back(MF->getMachineMemOperand(MMO, 4, 4));
-  }
-  MIBLo.setMemRefs(NewLoMMOs);
-  MIBHi.setMemRefs(NewHiMMOs);
-
   MBBI->eraseFromParent();
   return true;
 }
@@ -372,69 +502,48 @@ bool RISCVExpandPseudo::expandRV32ZdinxLoad(MachineBasicBlock &MBB,
       TRI->getSubReg(MBBI->getOperand(0).getReg(), RISCV::sub_gpr_even);
   Register Hi =
       TRI->getSubReg(MBBI->getOperand(0).getReg(), RISCV::sub_gpr_odd);
-  assert(Hi != RISCV::DUMMY_REG_PAIR_WITH_X0 && "Cannot write to X0_Pair");
 
-  MachineInstrBuilder MIBLo, MIBHi;
+  assert(MBBI->hasOneMemOperand() && "Expected mem operand");
+  MachineMemOperand *OldMMO = MBBI->memoperands().front();
+  MachineFunction *MF = MBB.getParent();
+  MachineMemOperand *MMOLo = MF->getMachineMemOperand(OldMMO, 0, 4);
+  MachineMemOperand *MMOHi = MF->getMachineMemOperand(OldMMO, 4, 4);
 
   // If the register of operand 1 is equal to the Lo register, then swap the
   // order of loading the Lo and Hi statements.
   bool IsOp1EqualToLo = Lo == MBBI->getOperand(1).getReg();
   // Order: Lo, Hi
   if (!IsOp1EqualToLo) {
-    MIBLo = BuildMI(MBB, MBBI, DL, TII->get(RISCV::LW), Lo)
-                .addReg(MBBI->getOperand(1).getReg())
-                .add(MBBI->getOperand(2));
+    BuildMI(MBB, MBBI, DL, TII->get(RISCV::LW), Lo)
+        .addReg(MBBI->getOperand(1).getReg())
+        .add(MBBI->getOperand(2))
+        .setMemRefs(MMOLo);
   }
 
   if (MBBI->getOperand(2).isGlobal() || MBBI->getOperand(2).isCPI()) {
     auto Offset = MBBI->getOperand(2).getOffset();
-    assert(Offset % 8 == 0);
+    assert(MBBI->getOperand(2).getOffset() % 8 == 0);
     MBBI->getOperand(2).setOffset(Offset + 4);
-    MIBHi = BuildMI(MBB, MBBI, DL, TII->get(RISCV::LW), Hi)
-                .addReg(MBBI->getOperand(1).getReg())
-                .add(MBBI->getOperand(2));
+    BuildMI(MBB, MBBI, DL, TII->get(RISCV::LW), Hi)
+        .addReg(MBBI->getOperand(1).getReg())
+        .add(MBBI->getOperand(2))
+        .setMemRefs(MMOHi);
     MBBI->getOperand(2).setOffset(Offset);
   } else {
     assert(isInt<12>(MBBI->getOperand(2).getImm() + 4));
-    MIBHi = BuildMI(MBB, MBBI, DL, TII->get(RISCV::LW), Hi)
-                .addReg(MBBI->getOperand(1).getReg())
-                .addImm(MBBI->getOperand(2).getImm() + 4);
+    BuildMI(MBB, MBBI, DL, TII->get(RISCV::LW), Hi)
+        .addReg(MBBI->getOperand(1).getReg())
+        .addImm(MBBI->getOperand(2).getImm() + 4)
+        .setMemRefs(MMOHi);
   }
 
   // Order: Hi, Lo
   if (IsOp1EqualToLo) {
-    MIBLo = BuildMI(MBB, MBBI, DL, TII->get(RISCV::LW), Lo)
-                .addReg(MBBI->getOperand(1).getReg())
-                .add(MBBI->getOperand(2));
+    BuildMI(MBB, MBBI, DL, TII->get(RISCV::LW), Lo)
+        .addReg(MBBI->getOperand(1).getReg())
+        .add(MBBI->getOperand(2))
+        .setMemRefs(MMOLo);
   }
-
-  MachineFunction *MF = MBB.getParent();
-  SmallVector<MachineMemOperand *> NewLoMMOs;
-  SmallVector<MachineMemOperand *> NewHiMMOs;
-  for (const MachineMemOperand *MMO : MBBI->memoperands()) {
-    NewLoMMOs.push_back(MF->getMachineMemOperand(MMO, 0, 4));
-    NewHiMMOs.push_back(MF->getMachineMemOperand(MMO, 4, 4));
-  }
-  MIBLo.setMemRefs(NewLoMMOs);
-  MIBHi.setMemRefs(NewHiMMOs);
-
-  MBBI->eraseFromParent();
-  return true;
-}
-
-bool RISCVExpandPseudo::expandPseudoReadVLENBViaVSETVLIX0(
-    MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI) {
-  DebugLoc DL = MBBI->getDebugLoc();
-  Register Dst = MBBI->getOperand(0).getReg();
-  unsigned Mul = MBBI->getOperand(1).getImm();
-  RISCVVType::VLMUL VLMUL = RISCVVType::encodeLMUL(Mul, /*Fractional=*/false);
-  unsigned VTypeImm = RISCVVType::encodeVTYPE(
-      VLMUL, /*SEW=*/8, /*TailAgnostic=*/true, /*MaskAgnostic=*/true);
-
-  BuildMI(MBB, MBBI, DL, TII->get(RISCV::PseudoVSETVLIX0))
-      .addReg(Dst, RegState::Define)
-      .addReg(RISCV::X0, RegState::Kill)
-      .addImm(VTypeImm);
 
   MBBI->eraseFromParent();
   return true;
@@ -459,6 +568,8 @@ public:
   }
 
 private:
+  bool expandDot(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
+                 MachineBasicBlock::iterator &NextMBBI);
   bool expandMBB(MachineBasicBlock &MBB);
   bool expandMI(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
                 MachineBasicBlock::iterator &NextMBBI);
@@ -496,6 +607,7 @@ private:
 char RISCVPreRAExpandPseudo::ID = 0;
 
 bool RISCVPreRAExpandPseudo::runOnMachineFunction(MachineFunction &MF) {
+  errs() << "*** RISCVPreRAExpandPseudo running on " << MF.getName() << "\n";
   STI = &MF.getSubtarget<RISCVSubtarget>();
   TII = STI->getInstrInfo();
 
@@ -531,7 +643,11 @@ bool RISCVPreRAExpandPseudo::expandMI(MachineBasicBlock &MBB,
                                       MachineBasicBlock::iterator MBBI,
                                       MachineBasicBlock::iterator &NextMBBI) {
 
+  errs() << ">>> expandMI: opcode = " << MBBI->getOpcode() << "\n";
   switch (MBBI->getOpcode()) {
+  /* case RISCV::DOT:
+    errs() << ">>> Detected DOT pseudo-instruction\n";
+    return expandDot(MBB, MBBI, NextMBBI);*/
   case RISCV::PseudoLLA:
     return expandLoadLocalAddress(MBB, MBBI, NextMBBI);
   case RISCV::PseudoLGA:
